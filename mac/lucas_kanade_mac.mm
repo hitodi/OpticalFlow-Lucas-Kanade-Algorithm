@@ -15,13 +15,28 @@ constexpr int kStepSize = 30;
 constexpr float kMinEigenvalue = 0.05f;
 constexpr float kMinEigenRatio = 0.03f;
 constexpr float kMinMotion = 0.15f;
-constexpr float kMaxMotion = 8.0f;
-constexpr float kDisplayScale = 3.0f;
+constexpr float kMaxMotion = 40.0f;
+constexpr float kDisplayScale = 2.0f;
+constexpr int kPyramidLevels = 4;
+constexpr int kIterationsPerLevel = 5;
+constexpr float kConvergenceEpsilon = 0.01f;
 
 struct Image {
     int width = 0;
     int height = 0;
     std::vector<std::uint8_t> rgba;
+};
+
+struct GrayImage {
+    int width = 0;
+    int height = 0;
+    std::vector<float> pixels;
+};
+
+struct Flow {
+    float u = 0.0f;
+    float v = 0.0f;
+    bool valid = false;
 };
 
 std::string fallbackPath(const std::string& path)
@@ -147,20 +162,79 @@ bool savePng(const Image& image, const std::string& path)
     return success;
 }
 
-std::vector<float> toGray(const Image& image)
+GrayImage toGray(const Image& image)
 {
-    std::vector<float> gray(static_cast<std::size_t>(image.width) * image.height);
+    GrayImage gray;
+    gray.width = image.width;
+    gray.height = image.height;
+    gray.pixels.resize(static_cast<std::size_t>(image.width) * image.height);
     for (int y = 0; y < image.height; ++y) {
         for (int x = 0; x < image.width; ++x) {
             const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 4;
             const float r = image.rgba[offset + 0] / 255.0f;
             const float g = image.rgba[offset + 1] / 255.0f;
             const float b = image.rgba[offset + 2] / 255.0f;
-            gray[static_cast<std::size_t>(y) * image.width + x] = 0.299f * r + 0.587f * g + 0.114f * b;
+            gray.pixels[static_cast<std::size_t>(y) * image.width + x] = 0.299f * r + 0.587f * g + 0.114f * b;
         }
     }
 
     return gray;
+}
+
+GrayImage downsampleHalf(const GrayImage& image)
+{
+    GrayImage result;
+    result.width = image.width / 2;
+    result.height = image.height / 2;
+    result.pixels.resize(static_cast<std::size_t>(result.width) * result.height);
+
+    for (int y = 0; y < result.height; ++y) {
+        for (int x = 0; x < result.width; ++x) {
+            const int source_x = x * 2;
+            const int source_y = y * 2;
+            const std::size_t i00 = static_cast<std::size_t>(source_y) * image.width + source_x;
+            const std::size_t i01 = i00 + 1;
+            const std::size_t i10 = i00 + image.width;
+            const std::size_t i11 = i10 + 1;
+            result.pixels[static_cast<std::size_t>(y) * result.width + x] =
+                0.25f * (image.pixels[i00] + image.pixels[i01] + image.pixels[i10] + image.pixels[i11]);
+        }
+    }
+
+    return result;
+}
+
+std::vector<GrayImage> buildPyramid(const GrayImage& base)
+{
+    std::vector<GrayImage> pyramid;
+    pyramid.push_back(base);
+    for (int level = 1; level < kPyramidLevels; ++level) {
+        const GrayImage& previous = pyramid.back();
+        if (previous.width < 64 || previous.height < 64) {
+            break;
+        }
+
+        pyramid.push_back(downsampleHalf(previous));
+    }
+
+    return pyramid;
+}
+
+float sampleBilinear(const GrayImage& image, float x, float y)
+{
+    if (x < 0.0f || y < 0.0f || x >= image.width - 1 || y >= image.height - 1) {
+        return 0.0f;
+    }
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const float tx = x - x0;
+    const float ty = y - y0;
+    const std::size_t index = static_cast<std::size_t>(y0) * image.width + x0;
+
+    const float top = (1.0f - tx) * image.pixels[index] + tx * image.pixels[index + 1];
+    const float bottom = (1.0f - tx) * image.pixels[index + image.width] + tx * image.pixels[index + image.width + 1];
+    return (1.0f - ty) * top + ty * bottom;
 }
 
 void setPixel(Image& image, int x, int y, std::uint8_t r, std::uint8_t g, std::uint8_t b)
@@ -233,6 +307,126 @@ float maxEigenvalue2x2(float a, float b, float c)
     return 0.5f * (trace + determinant_part);
 }
 
+bool refineFlowAtLevel(
+    const GrayImage& current,
+    const GrayImage& next,
+    float x,
+    float y,
+    float& u,
+    float& v)
+{
+    const int half_window = kWindowSize / 2;
+
+    for (int iteration = 0; iteration < kIterationsPerLevel; ++iteration) {
+        float sum_ix2 = 0.0f;
+        float sum_ixiy = 0.0f;
+        float sum_iy2 = 0.0f;
+        float sum_ixb = 0.0f;
+        float sum_iyb = 0.0f;
+
+        for (int offset_y = -half_window; offset_y <= half_window; ++offset_y) {
+            for (int offset_x = -half_window; offset_x <= half_window; ++offset_x) {
+                const float current_x = x + offset_x;
+                const float current_y = y + offset_y;
+                const float next_x = current_x + u;
+                const float next_y = current_y + v;
+
+                if (current_x < 1.0f || current_y < 1.0f ||
+                    current_x >= current.width - 2 || current_y >= current.height - 2 ||
+                    next_x < 1.0f || next_y < 1.0f ||
+                    next_x >= next.width - 2 || next_y >= next.height - 2) {
+                    continue;
+                }
+
+                const float current_dx =
+                    sampleBilinear(current, current_x + 1.0f, current_y) -
+                    sampleBilinear(current, current_x - 1.0f, current_y);
+                const float next_dx =
+                    sampleBilinear(next, next_x + 1.0f, next_y) -
+                    sampleBilinear(next, next_x - 1.0f, next_y);
+                const float current_dy =
+                    sampleBilinear(current, current_x, current_y + 1.0f) -
+                    sampleBilinear(current, current_x, current_y - 1.0f);
+                const float next_dy =
+                    sampleBilinear(next, next_x, next_y + 1.0f) -
+                    sampleBilinear(next, next_x, next_y - 1.0f);
+
+                const float ix = 0.25f * (current_dx + next_dx);
+                const float iy = 0.25f * (current_dy + next_dy);
+                const float it =
+                    sampleBilinear(next, next_x, next_y) -
+                    sampleBilinear(current, current_x, current_y);
+                const float b = -it;
+
+                sum_ix2 += ix * ix;
+                sum_ixiy += ix * iy;
+                sum_iy2 += iy * iy;
+                sum_ixb += ix * b;
+                sum_iyb += iy * b;
+            }
+        }
+
+        const float min_eigenvalue = minEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
+        const float max_eigenvalue = maxEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
+        if (min_eigenvalue < kMinEigenvalue ||
+            max_eigenvalue <= 0.0f ||
+            min_eigenvalue / max_eigenvalue < kMinEigenRatio) {
+            return false;
+        }
+
+        const float determinant = sum_ix2 * sum_iy2 - sum_ixiy * sum_ixiy;
+        if (std::fabs(determinant) < 1.0e-6f) {
+            return false;
+        }
+
+        const float delta_u = (sum_ixb * sum_iy2 - sum_ixiy * sum_iyb) / determinant;
+        const float delta_v = (sum_ix2 * sum_iyb - sum_ixiy * sum_ixb) / determinant;
+        u += delta_u;
+        v += delta_v;
+
+        if (delta_u * delta_u + delta_v * delta_v < kConvergenceEpsilon * kConvergenceEpsilon) {
+            break;
+        }
+    }
+
+    return true;
+}
+
+Flow estimatePyramidFlow(
+    const std::vector<GrayImage>& current_pyramid,
+    const std::vector<GrayImage>& next_pyramid,
+    int x,
+    int y)
+{
+    float u = 0.0f;
+    float v = 0.0f;
+    bool valid = false;
+
+    for (int level = static_cast<int>(current_pyramid.size()) - 1; level >= 0; --level) {
+        if (level != static_cast<int>(current_pyramid.size()) - 1) {
+            u *= 2.0f;
+            v *= 2.0f;
+        }
+
+        const float scale = 1.0f / static_cast<float>(1 << level);
+        const float level_x = x * scale;
+        const float level_y = y * scale;
+
+        valid = refineFlowAtLevel(current_pyramid[level], next_pyramid[level], level_x, level_y, u, v);
+        if (!valid) {
+            return {};
+        }
+    }
+
+    const float motion_squared = u * u + v * v;
+    if (motion_squared < kMinMotion * kMinMotion ||
+        motion_squared > kMaxMotion * kMaxMotion) {
+        return {};
+    }
+
+    return {u, v, true};
+}
+
 }  // namespace
 
 int main()
@@ -252,74 +446,19 @@ int main()
 
     const int width = current.width;
     const int height = current.height;
-    const std::vector<float> current_gray = toGray(current);
-    const std::vector<float> next_gray = toGray(next);
-
-    std::vector<float> df_dx(static_cast<std::size_t>(width) * height, 0.0f);
-    std::vector<float> df_dy(static_cast<std::size_t>(width) * height, 0.0f);
-    std::vector<float> df_dt(static_cast<std::size_t>(width) * height, 0.0f);
-
-    for (int y = 1; y < height - 1; ++y) {
-        for (int x = 1; x < width - 1; ++x) {
-            const std::size_t index = static_cast<std::size_t>(y) * width + x;
-            const float current_dx = current_gray[index + 1] - current_gray[index - 1];
-            const float next_dx = next_gray[index + 1] - next_gray[index - 1];
-            const float current_dy = current_gray[index + width] - current_gray[index - width];
-            const float next_dy = next_gray[index + width] - next_gray[index - width];
-
-            df_dx[index] = 0.25f * (current_dx + next_dx);
-            df_dy[index] = 0.25f * (current_dy + next_dy);
-            df_dt[index] = next_gray[index] - current_gray[index];
-        }
-    }
+    const std::vector<GrayImage> current_pyramid = buildPyramid(toGray(current));
+    const std::vector<GrayImage> next_pyramid = buildPyramid(toGray(next));
 
     const int half_window = kWindowSize / 2;
     for (int y = half_window + 1; y < height - half_window - 1; y += kStepSize) {
         for (int x = half_window + 1; x < width - half_window - 1; x += kStepSize) {
-            float sum_ix2 = 0.0f;
-            float sum_ixiy = 0.0f;
-            float sum_iy2 = 0.0f;
-            float sum_ixb = 0.0f;
-            float sum_iyb = 0.0f;
-
-            for (int window_y = y - half_window; window_y <= y + half_window; ++window_y) {
-                for (int window_x = x - half_window; window_x <= x + half_window; ++window_x) {
-                    const std::size_t index = static_cast<std::size_t>(window_y) * width + window_x;
-                    const float ix = df_dx[index];
-                    const float iy = df_dy[index];
-                    const float b = -df_dt[index];
-
-                    sum_ix2 += ix * ix;
-                    sum_ixiy += ix * iy;
-                    sum_iy2 += iy * iy;
-                    sum_ixb += ix * b;
-                    sum_iyb += iy * b;
-                }
-            }
-
-            const float min_eigenvalue = minEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
-            const float max_eigenvalue = maxEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
-            if (min_eigenvalue < kMinEigenvalue ||
-                max_eigenvalue <= 0.0f ||
-                min_eigenvalue / max_eigenvalue < kMinEigenRatio) {
+            const Flow flow = estimatePyramidFlow(current_pyramid, next_pyramid, x, y);
+            if (!flow.valid) {
                 continue;
             }
 
-            const float determinant = sum_ix2 * sum_iy2 - sum_ixiy * sum_ixiy;
-            if (std::fabs(determinant) < 1.0e-6f) {
-                continue;
-            }
-
-            const float u = (sum_ixb * sum_iy2 - sum_ixiy * sum_iyb) / determinant;
-            const float v = (sum_ix2 * sum_iyb - sum_ixiy * sum_ixb) / determinant;
-            const float motion_squared = u * u + v * v;
-            if (motion_squared < kMinMotion * kMinMotion ||
-                motion_squared > kMaxMotion * kMaxMotion) {
-                continue;
-            }
-
-            const int end_x = static_cast<int>(std::round(x + kDisplayScale * u));
-            const int end_y = static_cast<int>(std::round(y + kDisplayScale * v));
+            const int end_x = static_cast<int>(std::round(x + kDisplayScale * flow.u));
+            const int end_y = static_cast<int>(std::round(y + kDisplayScale * flow.v));
             if (end_x != x || end_y != y) {
                 drawArrow(current, x, y, end_x, end_y);
             }
