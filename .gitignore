@@ -32,6 +32,14 @@ bld/
 [Oo]ut/
 [Ll]og/
 [Ll]ogs/
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# macOS
+.DS_Store
 
 # Visual Studio 2015/2017 cache/options directory
 .vs/
