@@ -20,6 +20,9 @@ constexpr float kDisplayScale = 2.0f;
 constexpr int kPyramidLevels = 4;
 constexpr int kIterationsPerLevel = 5;
 constexpr float kConvergenceEpsilon = 0.01f;
+constexpr float kForwardBackwardTolerance = 2.0f;
+constexpr float kCornerMinEigenvalue = 0.04f;
+constexpr float kCornerMinEigenRatio = 0.03f;
 
 struct Image {
     int width = 0;
@@ -395,8 +398,8 @@ bool refineFlowAtLevel(
 Flow estimatePyramidFlow(
     const std::vector<GrayImage>& current_pyramid,
     const std::vector<GrayImage>& next_pyramid,
-    int x,
-    int y)
+    float x,
+    float y)
 {
     float u = 0.0f;
     float v = 0.0f;
@@ -427,6 +430,66 @@ Flow estimatePyramidFlow(
     return {u, v, true};
 }
 
+bool isTrackableCorner(const GrayImage& image, int x, int y)
+{
+    const int half_window = kWindowSize / 2;
+    float sum_ix2 = 0.0f;
+    float sum_ixiy = 0.0f;
+    float sum_iy2 = 0.0f;
+
+    if (x < half_window + 1 || y < half_window + 1 ||
+        x >= image.width - half_window - 1 ||
+        y >= image.height - half_window - 1) {
+        return false;
+    }
+
+    for (int offset_y = -half_window; offset_y <= half_window; ++offset_y) {
+        for (int offset_x = -half_window; offset_x <= half_window; ++offset_x) {
+            const int px = x + offset_x;
+            const int py = y + offset_y;
+            const std::size_t index = static_cast<std::size_t>(py) * image.width + px;
+            const float ix = 0.5f * (image.pixels[index + 1] - image.pixels[index - 1]);
+            const float iy = 0.5f * (image.pixels[index + image.width] - image.pixels[index - image.width]);
+
+            sum_ix2 += ix * ix;
+            sum_ixiy += ix * iy;
+            sum_iy2 += iy * iy;
+        }
+    }
+
+    const float min_eigenvalue = minEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
+    const float max_eigenvalue = maxEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
+    return min_eigenvalue >= kCornerMinEigenvalue &&
+        max_eigenvalue > 0.0f &&
+        min_eigenvalue / max_eigenvalue >= kCornerMinEigenRatio;
+}
+
+bool passesForwardBackwardCheck(
+    const std::vector<GrayImage>& current_pyramid,
+    const std::vector<GrayImage>& next_pyramid,
+    int x,
+    int y,
+    const Flow& forward_flow)
+{
+    const float next_x = x + forward_flow.u;
+    const float next_y = y + forward_flow.v;
+    const GrayImage& base_next = next_pyramid.front();
+    if (next_x < 0.0f || next_y < 0.0f ||
+        next_x >= base_next.width || next_y >= base_next.height) {
+        return false;
+    }
+
+    const Flow backward_flow = estimatePyramidFlow(next_pyramid, current_pyramid, next_x, next_y);
+    if (!backward_flow.valid) {
+        return false;
+    }
+
+    const float error_u = forward_flow.u + backward_flow.u;
+    const float error_v = forward_flow.v + backward_flow.v;
+    return error_u * error_u + error_v * error_v <=
+        kForwardBackwardTolerance * kForwardBackwardTolerance;
+}
+
 }  // namespace
 
 int main()
@@ -446,14 +509,23 @@ int main()
 
     const int width = current.width;
     const int height = current.height;
-    const std::vector<GrayImage> current_pyramid = buildPyramid(toGray(current));
+    const GrayImage current_gray = toGray(current);
+    const std::vector<GrayImage> current_pyramid = buildPyramid(current_gray);
     const std::vector<GrayImage> next_pyramid = buildPyramid(toGray(next));
 
     const int half_window = kWindowSize / 2;
     for (int y = half_window + 1; y < height - half_window - 1; y += kStepSize) {
         for (int x = half_window + 1; x < width - half_window - 1; x += kStepSize) {
+            if (!isTrackableCorner(current_gray, x, y)) {
+                continue;
+            }
+
             const Flow flow = estimatePyramidFlow(current_pyramid, next_pyramid, x, y);
             if (!flow.valid) {
+                continue;
+            }
+
+            if (!passesForwardBackwardCheck(current_pyramid, next_pyramid, x, y, flow)) {
                 continue;
             }
 
