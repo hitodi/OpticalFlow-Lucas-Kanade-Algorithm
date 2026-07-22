@@ -37,6 +37,8 @@ cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 compile_commands.json
+lucas_kanade_mac
+output_mac.png
 
 # macOS
 .DS_Store

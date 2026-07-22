@@ -9,13 +9,38 @@ The program compares two consecutive sample images:
 
 It estimates local motion vectors and draws them on the first frame.
 
-## Requirements
+## Requirements For The macOS Build
 
 - C++17 compiler
-- OpenCV 4.x
-- CMake 3.16 or newer, recommended for cross-platform builds
+- Xcode Command Line Tools
+
+The macOS build does not require OpenCV, CMake, or Homebrew.
+
+## Build On macOS Without OpenCV Or CMake
+
+The repository includes a macOS-native implementation that uses Apple's built-in ImageIO/CoreGraphics frameworks for PNG input/output. It does not require Homebrew, OpenCV, or CMake.
+
+Build:
+
+```sh
+make mac
+```
+
+Run:
+
+```sh
+make run-mac
+```
+
+The result is saved as:
+
+```text
+output_mac.png
+```
 
 ## Build With CMake
+
+This path is optional and requires OpenCV 4.x plus CMake 3.16 or newer.
 
 From the repository root:
 
