@@ -10,9 +10,13 @@
 
 namespace {
 
-constexpr int kWindowSize = 5;
-constexpr int kStepSize = 10;
-constexpr float kMinEigenvalue = 1.0e-4f;
+constexpr int kWindowSize = 21;
+constexpr int kStepSize = 30;
+constexpr float kMinEigenvalue = 0.05f;
+constexpr float kMinEigenRatio = 0.03f;
+constexpr float kMinMotion = 0.15f;
+constexpr float kMaxMotion = 8.0f;
+constexpr float kDisplayScale = 3.0f;
 
 struct Image {
     int width = 0;
@@ -149,9 +153,9 @@ std::vector<float> toGray(const Image& image)
     for (int y = 0; y < image.height; ++y) {
         for (int x = 0; x < image.width; ++x) {
             const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 4;
-            const float r = image.rgba[offset + 0];
-            const float g = image.rgba[offset + 1];
-            const float b = image.rgba[offset + 2];
+            const float r = image.rgba[offset + 0] / 255.0f;
+            const float g = image.rgba[offset + 1] / 255.0f;
+            const float b = image.rgba[offset + 2] / 255.0f;
             gray[static_cast<std::size_t>(y) * image.width + x] = 0.299f * r + 0.587f * g + 0.114f * b;
         }
     }
@@ -222,6 +226,13 @@ float minEigenvalue2x2(float a, float b, float c)
     return 0.5f * (trace - determinant_part);
 }
 
+float maxEigenvalue2x2(float a, float b, float c)
+{
+    const float trace = a + c;
+    const float determinant_part = std::sqrt((a - c) * (a - c) + 4.0f * b * b);
+    return 0.5f * (trace + determinant_part);
+}
+
 }  // namespace
 
 int main()
@@ -248,18 +259,23 @@ int main()
     std::vector<float> df_dy(static_cast<std::size_t>(width) * height, 0.0f);
     std::vector<float> df_dt(static_cast<std::size_t>(width) * height, 0.0f);
 
-    for (int y = 0; y < height - 1; ++y) {
-        for (int x = 0; x < width - 1; ++x) {
+    for (int y = 1; y < height - 1; ++y) {
+        for (int x = 1; x < width - 1; ++x) {
             const std::size_t index = static_cast<std::size_t>(y) * width + x;
-            df_dx[index] = current_gray[index + 1] - current_gray[index];
-            df_dy[index] = current_gray[index + width] - current_gray[index];
+            const float current_dx = current_gray[index + 1] - current_gray[index - 1];
+            const float next_dx = next_gray[index + 1] - next_gray[index - 1];
+            const float current_dy = current_gray[index + width] - current_gray[index - width];
+            const float next_dy = next_gray[index + width] - next_gray[index - width];
+
+            df_dx[index] = 0.25f * (current_dx + next_dx);
+            df_dy[index] = 0.25f * (current_dy + next_dy);
             df_dt[index] = next_gray[index] - current_gray[index];
         }
     }
 
     const int half_window = kWindowSize / 2;
-    for (int y = half_window; y < height - half_window; y += kStepSize) {
-        for (int x = half_window; x < width - half_window; x += kStepSize) {
+    for (int y = half_window + 1; y < height - half_window - 1; y += kStepSize) {
+        for (int x = half_window + 1; x < width - half_window - 1; x += kStepSize) {
             float sum_ix2 = 0.0f;
             float sum_ixiy = 0.0f;
             float sum_iy2 = 0.0f;
@@ -281,7 +297,11 @@ int main()
                 }
             }
 
-            if (minEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2) < kMinEigenvalue) {
+            const float min_eigenvalue = minEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
+            const float max_eigenvalue = maxEigenvalue2x2(sum_ix2, sum_ixiy, sum_iy2);
+            if (min_eigenvalue < kMinEigenvalue ||
+                max_eigenvalue <= 0.0f ||
+                min_eigenvalue / max_eigenvalue < kMinEigenRatio) {
                 continue;
             }
 
@@ -292,9 +312,14 @@ int main()
 
             const float u = (sum_ixb * sum_iy2 - sum_ixiy * sum_iyb) / determinant;
             const float v = (sum_ix2 * sum_iyb - sum_ixiy * sum_ixb) / determinant;
+            const float motion_squared = u * u + v * v;
+            if (motion_squared < kMinMotion * kMinMotion ||
+                motion_squared > kMaxMotion * kMaxMotion) {
+                continue;
+            }
 
-            const int end_x = static_cast<int>(std::round(x + u));
-            const int end_y = static_cast<int>(std::round(y + v));
+            const int end_x = static_cast<int>(std::round(x + kDisplayScale * u));
+            const int end_y = static_cast<int>(std::round(y + kDisplayScale * v));
             if (end_x != x || end_y != y) {
                 drawArrow(current, x, y, end_x, end_y);
             }
